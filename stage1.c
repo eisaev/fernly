@@ -10,9 +10,9 @@
 char welcome_banner1[] = "Fernly stage 1 loader for 6261\r\n";
 char welcome_banner2[] = "Write four bytes of program size, then write program data...\r\n>";
 
-//#define LOADADDR 0x70000000
+#define LOADADDR 0x70000000
 // for osmocom gen'd firmware use 0x40000000
-#define LOADADDR 0x40000000
+//#define LOADADDR 0x40000000
 
 int main()
 {

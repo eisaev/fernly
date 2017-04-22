@@ -58,13 +58,30 @@ STAGE1_SRC_S = \
 
 STAGE1_OBJ = $(addprefix $(BUILD)/, $(STAGE1_SRC_S:.S=.o) $(STAGE1_SRC_C:.c=.o))
 
+
+FRSER_SRC_C = \
+	frser.c \
+	bionic.c \
+	serial.c \
+	scriptic_spionly.c \
+	utils.c \
+	vectors.c
+
+FRSER_SRC_S = \
+	scriptic/spi.S \
+	scriptic/spi-blockmode.S \
+	start.S
+
+FRSER_OBJ = $(addprefix $(BUILD)/, $(FRSER_SRC_S:.S=.o) $(FRSER_SRC_C:.c=.o))
+
 all: $(BUILD)/firmware.bin \
 	$(BUILD)/stage1.bin \
 	$(BUILD)/dump-rom-usb.bin \
 	$(BUILD)/usb-loader.bin \
 	$(BUILD)/mt6261-test.bin \
 	$(BUILD)/fernly-usb-loader \
-	$(BUILD)/echo.bin
+	$(BUILD)/echo.bin \
+	$(BUILD)/frser.bin
 clean:
 	$(RM) -rf $(BUILD)
 
@@ -86,6 +103,12 @@ $(BUILD)/stage1.bin: $(BUILD)/stage1.elf
 
 $(BUILD)/stage1.elf: $(STAGE1_OBJ)
 	$(LD) $(STAGE1_LDFLAGS) --entry=reset_handler -o $@ $(STAGE1_OBJ) $(LIBS)
+
+$(BUILD)/frser.bin: $(BUILD)/frser.elf
+	$(OBJCOPY) -S -O binary $(BUILD)/frser.elf $@
+
+$(BUILD)/frser.elf: $(FRSER_OBJ)
+	$(LD) $(STAGE1_LDFLAGS) --entry=reset_handler -o $@ $(FRSER_OBJ) $(LIBS)
 
 $(OBJ): $(HEADER_BUILD)/generated.h | $(OBJ_DIRS)
 $(HEADER_BUILD)/generated.h: | $(HEADER_BUILD)

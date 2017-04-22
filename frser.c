@@ -1,7 +1,6 @@
 #include <string.h>
 #include "bionic.h"
 #include "memio.h"
-#include "printf.h"
 #include "serial.h"
 #include "utils.h"
 
@@ -9,13 +8,60 @@
 #include "fernvale-spi.h"
 #include "scriptic.h"
 
+extern struct scriptic set_plls;
+extern struct scriptic spi_run;
+extern struct scriptic spi_init;
+
+void usb_uart_read(void *buffer, int bytes, int timeout);
+void usb_uart_write(const void *data, int bytes, int timeout);
+void usb_uart_flush(void);
+
+int serial_putc(uint8_t c) {
+	usb_uart_write(&c, 1, 0);
+	return 0;
+}
+
+uint8_t serial_getc(void) {
+	uint8_t d;
+	usb_uart_read(&d, 1, 0);
+	return d;
+}
+
+void serial_write(const void *d, int bytes)
+{
+	usb_uart_write(d,bytes,0);
+	usb_uart_flush();
+}
+
+int serial_puts(const void *s)
+{
+	const char *str = s;
+	while(*str) {
+		/* Fix up linefeeds */
+		if (*str == '\n')
+			serial_putc('\r');
+		serial_putc(*str++);
+	}
+	usb_uart_flush();
+	return 0;
+}
+
+int serial_read(void *data, int bytes)
+{
+	int i;
+	uint8_t *d = data;
+	for (i=0;i<bytes;i++) d[i] = serial_getc();
+	return 0;
+}
+
+
 static void spi_cmd_txrx(uint8_t tx_size, uint8_t rx_size,
 		 uint8_t *tx_buf, uint8_t *rx_buf)
 {
 	memcpy(SPI_DATA, tx_buf, tx_size);
 	writel(tx_size, SPI_WRITE_COUNT);
 	writel(rx_size, SPI_READ_COUNT);
-	scriptic_run("spi_run");
+	scriptic_execute(&spi_run);
 	memcpy(rx_buf, SPI_DATA + tx_size, rx_size);
 }
 
@@ -37,7 +83,7 @@ static void spi_cmd_txrx(uint8_t tx_size, uint8_t rx_size,
 const char ca_iface[3] = { S_ACK, 0x01, 0x00 };
 const char ca_bitmap[33] = { S_ACK, 0xBF, 0xC9, 0xF, 0, 0 };
 const char ca_pgmname[17] = "\x06" FRSER_NAME; /* Small hack to include S_ACK in the name. */
-const char ca_serbuf[3] = { S_ACK, 0, 4 };
+const char ca_serbuf[3] = { S_ACK, 2, 0 };
 const char ca_syncnop[2] = { S_NAK, S_ACK };
 
 const char ca_opbufsz[3] = { S_ACK, 128, 0 };
@@ -116,7 +162,7 @@ static void frser_operation(uint8_t op) {
 	}
 
 	p_len = op2len[op];
-	serial_read(parbuf, p_len);
+	if (p_len) serial_read(parbuf, p_len);
 
 	/* These are the operations that need real acting upon: */
 	switch (op) {
@@ -139,15 +185,16 @@ int main()
 {
 	uint8_t out[1] = { 0x9F };
 	uint8_t in[3];
-	serial_init();
 	serial_puts(FRSER_NAME "\n");
+
 	/* Disable system watchdog */
 	writel(0x2200, 0xa0030000);
 	/* Enable USB Download mode (required for no-battery operation) */
 	writew(0x8000, PMIC_CTRL10);
 	/* Disable battery watchdog */
 	writew(0x2, PMIC_CTRL9);
-	scriptic_run("spi_init");
+	scriptic_execute(&set_plls);
+	scriptic_execute(&spi_init);
 	serial_puts("Initialized.\n");
 	spi_cmd_txrx(1, 3, out, in);
 	serial_puts("RDID:");
@@ -156,12 +203,8 @@ int main()
 	serial_puth(in[2], 2);
 	serial_puts("\n> ");
 	for(;;) {
-		char c = serial_getc();
-		serial_puth(c,2);
-		if (c < 0x20) break;
-	}
-	for(;;) {
 		frser_operation(serial_getc());
+		usb_uart_flush();
 	}
 	return 0;
 }

@@ -5,21 +5,6 @@
 
 //#define SCRIPTIC_DEBUG /* Enable this to print commands as they're executed */
 
-extern struct scriptic set_plls;
-extern struct scriptic enable_psram;
-extern struct scriptic spi_run;
-extern struct scriptic spi_run;
-extern struct scriptic spi_init;
-extern struct scriptic set_kbd;
-
-static struct scriptic *scripts[] = {
-	&set_plls,
-	&enable_psram,
-	&spi_run,
-	&spi_init,
-	&set_kbd,
-};
-
 #ifdef SCRIPTIC_DEBUG
 static void sc_print_header(void *p)
 {
@@ -203,7 +188,7 @@ void sc_usleep(struct scriptic_usleep *pkt)
 
 /* Exported functions */
 
-int scriptic_execute(const struct scriptic *script)
+int scriptic_execute(struct scriptic *script)
 {
 	void *header;
 
@@ -213,6 +198,9 @@ int scriptic_execute(const struct scriptic *script)
 #endif
 		return -1;
 	}
+
+	if (script->command_count == 0)
+		script->command_count = sc_command_count(script);
 
 	header = (struct scriptic_header *)&script[1];
 
@@ -264,34 +252,3 @@ int scriptic_execute(const struct scriptic *script)
 	return 0;
 }
 
-const struct scriptic *scriptic_get(const char *name)
-{
-	struct scriptic *script = NULL;
-	int i;
-
-	for (i = 0; i < sizeof(scripts) / sizeof(*scripts); i++) {
-		if (!_strcasecmp(name, scripts[i]->name)) {
-			script = scripts[i];
-			break;
-		}
-	}
-
-	if (script && script->command_count == 0)
-		script->command_count = sc_command_count(script);
-
-	return script;
-}
-
-int scriptic_run(const char *name)
-{
-	const struct scriptic *script;
-
-	script = scriptic_get(name);
-	if (!script) {
-#ifdef SCRIPTIC_DEBUG
-		printf("scriptic: Unrecognized script name: %s\n", name);
-#endif
-		return -1;
-	}
-	return scriptic_execute(script);
-}

@@ -1,2 +1,2 @@
-./build/fernly-usb-loader -w -s /dev/ttyUSB1 ./build/frser.bin
+./build/fernly-usb-loader -w /dev/fernvale ./build/frser.bin
 

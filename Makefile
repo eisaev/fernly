@@ -31,7 +31,8 @@ SRC_C = \
 	irq.c \
 	lcd.c \
 	main.c \
-	scriptic.c \
+	scriptic_core.c \
+	scriptic_helper.c \
 	serial.c \
 	spi.c \
 	utils.c \
@@ -62,14 +63,15 @@ STAGE1_OBJ = $(addprefix $(BUILD)/, $(STAGE1_SRC_S:.S=.o) $(STAGE1_SRC_C:.c=.o))
 FRSER_SRC_C = \
 	frser.c \
 	bionic.c \
-	serial.c \
-	scriptic_spionly.c \
+	scriptic_core.c \
 	utils.c \
 	vectors.c
 
 FRSER_SRC_S = \
 	scriptic/spi.S \
 	scriptic/spi-blockmode.S \
+	scriptic/set-plls.S \
+	rom_usb_uart.S \
 	start.S
 
 FRSER_OBJ = $(addprefix $(BUILD)/, $(FRSER_SRC_S:.S=.o) $(FRSER_SRC_C:.c=.o))

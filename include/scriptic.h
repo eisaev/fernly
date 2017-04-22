@@ -172,8 +172,8 @@ struct scriptic {
 	uint32_t 	 	command_count;
 } __attribute__((__packed__));
 
-int scriptic_execute(const struct scriptic *script);
-const struct scriptic *scriptic_get(const char *name);
+int scriptic_execute(struct scriptic *script);
+struct scriptic *scriptic_get(const char *name);
 int scriptic_run(const char *name);
 
 #endif /* __ASSEMBLY__ */

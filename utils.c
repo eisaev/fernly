@@ -53,7 +53,7 @@ int serial_print_hex_offset(const void *block, int count, int offset)
 			serial_putc(_isprint(b[offset + byte]) ?
 					b[offset + byte] :
 					'.');
-			serial_puts("|\n");
+		serial_puts("|\n");
 	}
 	return 0;
 }

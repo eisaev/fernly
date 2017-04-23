@@ -34,7 +34,7 @@ struct scriptic *scriptic_get(const char *name)
 
 int scriptic_run(const char *name)
 {
-	const struct scriptic *script;
+	struct scriptic *script;
 
 	script = scriptic_get(name);
 	if (!script) {

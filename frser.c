@@ -30,7 +30,6 @@ uint8_t serial_getc(void) {
 void serial_write(const void *d, int bytes)
 {
 	usb_uart_write(d,bytes,0);
-	usb_uart_flush();
 }
 
 int serial_puts(const void *s)
@@ -193,6 +192,7 @@ int main()
 	writew(0x8000, PMIC_CTRL10);
 	/* Disable battery watchdog */
 	writew(0x2, PMIC_CTRL9);
+
 	scriptic_execute(&set_plls);
 	scriptic_execute(&spi_init);
 	serial_puts("Initialized.\n");

@@ -1,20 +1,26 @@
 #include <stdio.h>
-#include <termios.h>
 #include <stdlib.h>
 #include <ctype.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdarg.h>
-#include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <getopt.h>
+
+#define IS_WINDOWS (defined(_WIN32) || defined(_WIN64) || defined(__WIN32__) || defined(__WINDOWS__))
+#if IS_WINDOWS
+#include <windows.h>
+#include <conio.h>
+#else
+#include <termios.h>
+#include <unistd.h>
 #include <sys/types.h>
 #include <arpa/inet.h>
-#include <getopt.h>
+#endif
 
 #include "sha1.h"
 
-#define BAUDRATE B115200
 #define STAGE_2_WRITE_ALL_AT_ONCE 1 /* Write stage 2 in one write() */
 #define STAGE_2_WRITE_SIZE 1
 #define STAGE_3_WRITE_ALL_AT_ONCE 1 /* Write stage 3 in one write() */
@@ -24,7 +30,6 @@
 #define ASSERT(x) do { if ((x)) exit(1); } while(0)
 
 static const uint32_t mtk_config_offset = 0x80000000;
-static struct termios old_termios;
 const char prompt[] = "fernly>";
 
 enum mtk_commands {
@@ -80,9 +85,68 @@ struct gfh_file_info {
 static const uint8_t mtk_banner[]	   = { 0xa0, 0x0a, 0x50, 0x05 };
 static const uint8_t mtk_banner_response[] = { 0x5f, 0xf5, 0xaf, 0xfa };
 
+#if IS_WINDOWS
+typedef DWORD ret_t;
+typedef HANDLE fd_t;
+
+#define BAUDRATE 115200
+
+#define ser_close(serfd) CloseHandle(serfd)
+#define restore_termios(...) 0
+#define tcdrain(...) 0
+#else
+typedef ssize_t ret_t;
+typedef int  fd_t;
+
+static struct termios old_termios;
+
+#define BAUDRATE B115200
+
+#define ser_close(serfd) close(serfd)
 static void restore_termios(void)
 {
 	tcsetattr(1, TCSANOW, &old_termios);
+}
+#endif
+
+static ret_t ser_write(fd_t fd, void *b, int size)
+{
+	ret_t ret = 0;
+	uint8_t *bfr = b;
+
+#if IS_WINDOWS
+	WriteFile(fd, bfr, size, &ret, NULL);
+#else
+	ret = write(fd, bfr, size);
+#endif
+
+	return ret;
+}
+
+static ret_t ser_read(fd_t fd, void *b, int size)
+{
+	ret_t ret = 0;
+	uint8_t *bfr = b;
+
+#if IS_WINDOWS
+	ReadFile(fd, bfr, size, &ret, NULL);
+#else
+	ret = read(fd, bfr, size);
+#endif
+
+	return ret;
+}
+
+void sleep_ms(int milliseconds)
+{
+#if IS_WINDOWS
+	Sleep(milliseconds);
+#else
+	struct timespec ts;
+	ts.tv_sec = milliseconds / 1000;
+	ts.tv_nsec = (milliseconds % 1000) * 1000000;
+	nanosleep(&ts, NULL);
+#endif
 }
 
 int print_hex_offset(const void *block, int count, int offset, uint32_t start)
@@ -119,28 +183,28 @@ int print_hex(const void *block, int count, uint32_t start)
 	return print_hex_offset(block, count, 0, start);
 }
 
-static int fernvale_txrx(int fd, void *b, int size) {
+static int fernvale_txrx(fd_t serfd, void *b, int size) {
 	uint8_t response[size];
 	uint8_t *bfr = b;
-	int ret;
+	ret_t ret = 0;
 
 //	printf("Writing data: "); print_hex(bfr, size, 0);
-	ret = write(fd, bfr, size);
+	ret = ser_write(serfd, bfr, size);
 	if (ret != size) {
 		if (ret == -1)
 			perror("Unable to write buffer");
 		else
-			printf("Wanted to write %d bytes, but read %d\n",
+			printf("Wanted to write %d bytes, but read %ld\n",
 					size, ret);
 		return -1;
 	}
 
-	ret = read(fd, response, size);
+	ret = ser_read(serfd, response, size);
 	if (ret != size) {
 		if (ret == -1)
 			perror("Unable to read response");
 		else
-			printf("Wanted to read %d bytes, but read %d (%x)\n",
+			printf("Wanted to read %d bytes, but read %ld (%x)\n",
 					size, ret, response[0]);
 		return -1;
 	}
@@ -161,22 +225,22 @@ static int fernvale_txrx(int fd, void *b, int size) {
 	return 0;
 }
 
-int fernvale_send_cmd(int fd, uint8_t bfr) {
-	return fernvale_txrx(fd, &bfr, sizeof(bfr));
+int fernvale_send_cmd(fd_t serfd, uint8_t bfr) {
+	return fernvale_txrx(serfd, &bfr, sizeof(bfr));
 }
 
-int fernvale_send_int16(int fd, uint16_t word) {
+int fernvale_send_int16(fd_t serfd, uint16_t word) {
 	uint8_t bfr[2];
 	bfr[0] = word >> 8;
 	bfr[1] = word >> 0;
-	return fernvale_txrx(fd, bfr, sizeof(bfr));
+	return fernvale_txrx(serfd, bfr, sizeof(bfr));
 }
 
-uint16_t fernvale_get_int8(int fd) {
+uint16_t fernvale_get_int8(fd_t serfd) {
 	uint8_t bfr;
 	int ret;
 
-	ret = read(fd, &bfr, sizeof(bfr));
+	ret = ser_read(serfd, &bfr, sizeof(bfr));
 	if (ret != sizeof(bfr)) {
 		perror("Unable to read 16 bits");
 		return -1;
@@ -184,50 +248,51 @@ uint16_t fernvale_get_int8(int fd) {
 	return bfr;
 }
 
-int fernvale_get_int16(int fd) {
+int fernvale_get_int16(fd_t serfd) {
 	uint16_t bfr, out;
 	int ret;
 
-	ret = read(fd, &bfr, sizeof(bfr));
+	ret = ser_read(serfd, &bfr, sizeof(bfr));
 	if (ret != sizeof(bfr)) {
 		perror("Unable to read 16 bits");
 		return -1;
 	}
 	out = ((bfr >> 8) & 0x00ff)
 	    | ((bfr << 8) & 0xff00);
+
 	return out;
 }
 
-uint32_t fernvale_get_int32(int fd) {
+uint32_t fernvale_get_int32(fd_t serfd) {
 	uint32_t bfr, out;
 	int ret;
 
-	ret = read(fd, &bfr, sizeof(bfr));
+	ret = ser_read(serfd, &bfr, sizeof(bfr));
 	if (ret != sizeof(bfr)) {
 		perror("Unable to read 32 bits");
 		return -1;
 	}
-
 	out = ((bfr >> 24) & 0x000000ff)
 	    | ((bfr >>  8) & 0x0000ff00)
 	    | ((bfr <<  8) & 0x00ff0000)
 	    | ((bfr << 24) & 0xff000000);
+
 	return out;
 }
 
-static int fernvale_send_int32(int fd, uint32_t word) {
+static int fernvale_send_int32(fd_t serfd, uint32_t dword) {
 	uint8_t bfr[4];
-	bfr[0] = word >> 24;
-	bfr[1] = word >> 16;
-	bfr[2] = word >> 8;
-	bfr[3] = word >> 0;
-	return fernvale_txrx(fd, bfr, sizeof(bfr));
+	bfr[0] = dword >> 24;
+	bfr[1] = dword >> 16;
+	bfr[2] = dword >> 8;
+	bfr[3] = dword >> 0;
+	return fernvale_txrx(serfd, bfr, sizeof(bfr));
 }
 
-int fernvale_send_int8_no_response(int fd, uint8_t byte) {
+int fernvale_send_int8_no_response(fd_t serfd, uint8_t byte) {
 
 	int ret;
-	ret = write(fd, &byte, sizeof(byte));
+	ret = ser_write(serfd, &byte, sizeof(byte));
 	if (ret != sizeof(byte)) {
 		if (ret == -1)
 			perror("Unable to write buffer");
@@ -239,14 +304,14 @@ int fernvale_send_int8_no_response(int fd, uint8_t byte) {
 	return 0;
 }
 
-int fernvale_send_int16_no_response(int fd, uint32_t word) {
+int fernvale_send_int16_no_response(fd_t serfd, uint16_t word) {
 	uint8_t bfr[2];
 	int ret;
 
 	bfr[0] = word >> 8;
 	bfr[1] = word >> 0;
 
-	ret = write(fd, bfr, sizeof(bfr));
+	ret = ser_write(serfd, bfr, sizeof(bfr));
 	if (ret != sizeof(bfr)) {
 		if (ret == -1)
 			perror("Unable to write buffer");
@@ -258,16 +323,16 @@ int fernvale_send_int16_no_response(int fd, uint32_t word) {
 	return 0;
 }
 
-int fernvale_send_int32_no_response(int fd, uint32_t word) {
+int fernvale_send_int32_no_response(fd_t serfd, uint32_t dword) {
 	uint8_t bfr[4];
 	int ret;
 
-	bfr[0] = word >> 24;
-	bfr[1] = word >> 16;
-	bfr[2] = word >> 8;
-	bfr[3] = word >> 0;
+	bfr[0] = dword >> 24;
+	bfr[1] = dword >> 16;
+	bfr[2] = dword >> 8;
+	bfr[3] = dword >> 0;
 
-	ret = write(fd, bfr, sizeof(bfr));
+	ret = ser_write(serfd, bfr, sizeof(bfr));
 	if (ret != sizeof(bfr)) {
 		if (ret == -1)
 			perror("Unable to write buffer");
@@ -279,22 +344,22 @@ int fernvale_send_int32_no_response(int fd, uint32_t word) {
 	return 0;
 }
 
-int fernvale_cmd_jump(int fd, uint32_t addr) {
+int fernvale_cmd_jump(fd_t serfd, uint32_t addr) {
 	int ret;
 
-	ret = fernvale_send_cmd(fd, 0xd5);
+	ret = fernvale_send_cmd(serfd, 0xd5);
 	if (ret) {
 		fprintf(stderr, "Unable to send jump command ");
 		return ret;
 	}
 
-	ret = fernvale_send_int32(fd, addr);
+	ret = fernvale_send_int32(serfd, addr);
 	if (ret) {
 		fprintf(stderr, "Unable to send address ");
 		return ret;
 	}
 
-	ret = fernvale_get_int16(fd);
+	ret = fernvale_get_int16(serfd);
 	if (ret) {
 		fprintf(stderr, "Error while jumping: 0x%04x ", ret);
 		return ret;
@@ -303,7 +368,7 @@ int fernvale_cmd_jump(int fd, uint32_t addr) {
 	return 0;
 }
 
-int fernvale_cmd_send_fd(int fd, uint32_t addr, int binfd)
+int fernvale_cmd_send_fd(fd_t serfd, uint32_t addr, FILE *binfd)
 {
 	struct stat stats;
 	uint16_t checksum, checksum_calc;
@@ -314,9 +379,9 @@ int fernvale_cmd_send_fd(int fd, uint32_t addr, int binfd)
 	uint32_t size;
 	uint8_t *bfr;
 
-	if (-1 == fstat(binfd, &stats)) {
+	if (-1 == fstat(fileno(binfd), &stats)) {
 		perror("Unable to get file stats");
-		close(binfd);
+		fclose(binfd);
 		return -1;
 	}
 
@@ -333,27 +398,27 @@ int fernvale_cmd_send_fd(int fd, uint32_t addr, int binfd)
 		return -1;
 	}
 
-	if (size != read(binfd, bfr, size)) {
+	if (size != fread(bfr, 1, size, binfd)) {
 		perror("Unable to read file for sending");
-		close(binfd);
+		fclose(binfd);
 		free(bfr);
 		return -1;
 	}
 
-	close(binfd);
+	fclose(binfd);
 
-	fernvale_send_cmd(fd, 0xd7);
-	fernvale_send_int32(fd, addr);
-	fernvale_send_int32(fd, size);
-	fernvale_send_int32(fd, signature_len);
+	fernvale_send_cmd(serfd, 0xd7);
+	fernvale_send_int32(serfd, addr);
+	fernvale_send_int32(serfd, size);
+	fernvale_send_int32(serfd, signature_len);
 
 	/* Not sure what this response is, but it's always 0 */
-	response = fernvale_get_int16(fd);
+	response = fernvale_get_int16(serfd);
 	if (response != 0)
 		printf("!! First response is 0x%04x, not 0 !!\n", response);
 
 	bfr[size - 1] ^= 0xff;
-	response = write(fd, bfr, size);
+	response = ser_write(serfd, bfr, size);
 	if (response != size) {
 		if (response == -1)
 			perror("Unable to write file");
@@ -367,7 +432,7 @@ int fernvale_cmd_send_fd(int fd, uint32_t addr, int binfd)
 	}
 
 	/* Calculate a checksum of the whole file */
-	checksum = fernvale_get_int16(fd);
+	checksum = fernvale_get_int16(serfd);
 	{
 		int i;
 		uint16_t *checksum_ptr = (uint16_t *)bfr;
@@ -382,7 +447,7 @@ int fernvale_cmd_send_fd(int fd, uint32_t addr, int binfd)
 			checksum, checksum_calc);
 
 	/* Not sure what this response is, but it's always 0 */
-	response = fernvale_get_int16(fd);
+	response = fernvale_get_int16(serfd);
 	if (response != 0)
 		printf("!! Final response is 0x%04x, not 0 !!\n", response);
 
@@ -390,28 +455,26 @@ int fernvale_cmd_send_fd(int fd, uint32_t addr, int binfd)
 	return 0;
 }
 
-int fernvale_send_bootloader(int fd, uint32_t addr, uint32_t stack,
+int fernvale_send_bootloader(fd_t serfd, uint32_t addr, uint32_t stack,
 			uint32_t unk, const char *filename) {
 
 	struct stat stats;
 	struct gfh_file_info *info;
 	uint16_t checksum, checksum_calc;
 	uint32_t size;
-	int ret;
+	ret_t ret;
 	int tmp;
-	int binfd;
+	FILE *binfd;
 
-	ret = 0;
-
-	binfd = open(filename, O_RDONLY);
-	if (-1 == binfd) {
+	binfd = fopen(filename, "rb");
+	if (NULL == binfd) {
 		perror("Unable to open bootloader for sending");
 		return -1;
 	}
 
-	if (-1 == fstat(binfd, &stats)) {
+	if (-1 == fstat(fileno(binfd), &stats)) {
 		perror("Unable to get file stats");
-		close(binfd);
+		fclose(binfd);
 		return -1;
 	}
 
@@ -419,13 +482,13 @@ int fernvale_send_bootloader(int fd, uint32_t addr, uint32_t stack,
 
 	uint8_t bfr[size];
 
-	if (size != read(binfd, bfr, size)) {
+	if (size != fread(bfr, 1, size, binfd)) {
 		perror("Unable to read file for sending");
-		close(binfd);
+		fclose(binfd);
 		return -1;
 	}
 
-	close(binfd);
+	fclose(binfd);
 
 	/* XXX PATCH BOOTLOADER */
 	info = (struct gfh_file_info *)bfr;
@@ -475,19 +538,24 @@ int fernvale_send_bootloader(int fd, uint32_t addr, uint32_t stack,
 	printf("Hash:\n");
 	print_hex(bfr + size - info->sig_len, info->sig_len, 0);
 
-	fernvale_send_cmd(fd, 0xd9);
-	fernvale_send_int32(fd, addr);
-	fernvale_send_int32(fd, size);	// Number of bytes
-	fernvale_send_int32(fd, stack);
-	fernvale_send_int32(fd, unk);
-	tmp = fernvale_get_int16(fd);
+	fernvale_send_cmd(serfd, 0xd9);
+	fernvale_send_int32(serfd, addr);
+	fernvale_send_int32(serfd, size);	// Number of bytes
+	fernvale_send_int32(serfd, stack);
+	fernvale_send_int32(serfd, unk);
+	tmp = fernvale_get_int16(serfd);
 
 	if (tmp != 0) {
 		printf("Response 0xd9 (1) was not 0, was 0x%04x\n", tmp);
-		ret = -1;
+		return -1;
 	}
 
-	write(fd, bfr, size);
+	ret = ser_write(serfd, bfr, size);
+	if (ret != size) {
+		perror("Unable to send bootloader");
+		return -1;
+	}
+
 	{
 		int i;
 		uint16_t *checksum_ptr = (uint16_t *)bfr;
@@ -495,47 +563,47 @@ int fernvale_send_bootloader(int fd, uint32_t addr, uint32_t stack,
 		for (i = 0; i < sizeof(bfr); i += 2)
 			checksum_calc ^= *checksum_ptr++;
 	}
-	checksum = fernvale_get_int16(fd);
+	checksum = fernvale_get_int16(serfd);
 	if (checksum == checksum_calc)
 		printf("Checksum matches: 0x%04x\n", checksum);
 	else
 		printf("Checksum differs.  Received: 0x%04x  Calculated: 0x%04x)\n", checksum, checksum_calc);
 
-	tmp = fernvale_get_int16(fd);
+	tmp = fernvale_get_int16(serfd);
 	if (tmp != 0) {
 		printf("Response 0xd9 (2) was not 0, was 0x%04x\n", tmp);
-		ret = -1;
+		return -1;
 	}
 
-	tmp = fernvale_get_int32(fd);
+	tmp = fernvale_get_int32(serfd);
 	if (tmp != 0) {
 		printf("Response 0xd9 (4) was not 0, was 0x%08x\n", tmp);
-		ret = -1;
+		return -1;
 	}
 
-	return ret;
+	return 0;
 }
 
-static int fernvale_print_me(int fd) {
-	int ret;
+static int fernvale_print_me(fd_t serfd) {
+	ret_t ret = 0;
 	uint32_t size;
 	uint16_t footer;
 
-	ret = fernvale_send_cmd(fd, mtk_get_me);
+	ret = fernvale_send_cmd(serfd, mtk_get_me);
 	if (ret)
 		return ret;
 
-	size = fernvale_get_int32(fd);
+	size = fernvale_get_int32(serfd);
 
 	uint8_t bfr[size];
 
-	ret = read(fd, bfr, size);
+	ret = ser_read(serfd, bfr, size);
 	if (ret != size) {
 		perror("Unable to read from ME buffer");
 		return -1;
 	}
 
-	footer = fernvale_get_int16(fd);
+	footer = fernvale_get_int16(serfd);
 	(void)footer;
 
 	print_hex(bfr, size, 0);
@@ -543,26 +611,26 @@ static int fernvale_print_me(int fd) {
 	return 0;
 }
 
-static int fernvale_print_sec_conf(int fd) {
+static int fernvale_print_sec_conf(fd_t serfd) {
 	int ret;
 	uint32_t size;
 	uint16_t footer;
 
-	ret = fernvale_send_cmd(fd, mtk_get_sec_conf);
+	ret = fernvale_send_cmd(serfd, mtk_get_sec_conf);
 	if (ret)
 		return ret;
 
-	size = fernvale_get_int32(fd);
+	size = fernvale_get_int32(serfd);
 
 	uint8_t bfr[size];
 
-	ret = read(fd, bfr, size);
+	ret = ser_read(serfd, bfr, size);
 	if (ret != size) {
 		perror("Unable to read from Sec Conf buffer");
 		return -1;
 	}
 
-	footer = fernvale_get_int16(fd);
+	footer = fernvale_get_int16(serfd);
 	(void)footer;
 
 	if (size)
@@ -573,26 +641,26 @@ static int fernvale_print_sec_conf(int fd) {
 	return 0;
 }
 
-static int fernvale_send_do_security(int fd) {
-	return fernvale_send_cmd(fd, mtk_do_security);
+static int fernvale_send_do_security(fd_t serfd) {
+	return fernvale_send_cmd(serfd, mtk_do_security);
 }
 
-static int fernvale_security_version(int fd) {
-	int ret;
+static int fernvale_security_version(fd_t serfd) {
+	ret_t ret = 0;
 	uint8_t bfr[1];
 
 	bfr[0] = mtk_firmware_version;
-	ret = write(fd, bfr, 1);
+	ret = ser_write(serfd, bfr, 1);
 	if (ret != 1) {
 		perror("Unable to write security character");
 		return -1;
 	}
-	ret = read(fd, bfr, sizeof(bfr));
+	ret = ser_read(serfd, bfr, sizeof(bfr));
 	if (ret != sizeof(bfr)) {
 		if (ret == -1)
 			perror("Unable to read response");
 		else {
-			printf("Wanted to read %d bytes, but got %d", 1, ret);
+			printf("Wanted to read %d bytes, but got %ld", 1, ret);
 			fflush(stdout);
 		}
 		return -1;
@@ -604,25 +672,25 @@ static int fernvale_security_version(int fd) {
 	return bfr[0];
 }
 
-static int fernvale_hello(int fd) {
+static int fernvale_hello(fd_t serfd) {
 	int i;
-	int ret;
+	ret_t ret = 0;
 	uint8_t bfr[1];
 
 	for (i = 0; i < sizeof(mtk_banner); i++) {
 		bfr[0] = mtk_banner[i];
-		ret = write(fd, bfr, sizeof(bfr));
+		ret = ser_write(serfd, bfr, sizeof(bfr));
 		if (ret != sizeof(bfr)) {
 			perror("Unable to write banner character");
 			return -1;
 		}
 
-		ret = read(fd, bfr, sizeof(bfr));
+		ret = ser_read(serfd, bfr, sizeof(bfr));
 		if (ret != sizeof(bfr)) {
 			if (ret == -1)
 				perror("Unable to read response");
 			else {
-				printf("Wanted to read %d bytes, but got %d ",
+				printf("Wanted to read %d bytes, but got %ld ",
 						1, ret);
 				fflush(stdout);
 			}
@@ -641,31 +709,31 @@ static int fernvale_hello(int fd) {
 	return 0;
 }
 
-static int fernvale_memory_read(int fd, uint32_t addr, uint32_t count,
+static int fernvale_memory_read(fd_t serfd, uint32_t addr, uint32_t count,
 				void *bfr) {
-	int ret;
+	ret_t ret = 0;
 	uint8_t *b = bfr;
 	int i;
 
-	ret = fernvale_send_cmd(fd, mtk_cmd_old_read16);
+	ret = fernvale_send_cmd(serfd, mtk_cmd_old_read16);
 	if (ret)
 		return ret;
 
-	ret = fernvale_send_int32(fd, addr);
+	ret = fernvale_send_int32(serfd, addr);
 	if (ret)
 		return ret;
 
 	/* "Count" is in units of 16-bit words, not 8-bit bytes */
-	ret = fernvale_send_int32(fd, count / 2);
+	ret = fernvale_send_int32(serfd, count / 2);
 	if (ret)
 		return ret;
 
-	ret = read(fd, bfr, count);
+	ret = ser_read(serfd, bfr, count);
 	if (ret != count) {
 		if (ret == -1)
 			perror("Unable to read data");
 		else
-			fprintf(stderr, "Wanted %d bytes, got %d bytes\n",
+			fprintf(stderr, "Wanted %d bytes, got %ld bytes\n",
 					count, ret);
 		return -1;
 	}
@@ -680,24 +748,24 @@ static int fernvale_memory_read(int fd, uint32_t addr, uint32_t count,
 	return 0;
 }
 
-int fernvale_memory_write(int fd, uint32_t addr, uint32_t count,
+int fernvale_memory_write(fd_t serfd, uint32_t addr, uint32_t count,
 				 void *bfr) {
-	int ret;
+	ret_t ret = 0;
 	uint8_t *b = bfr;
 
 	if (count & 1)
 		count++;
 
-	ret = fernvale_send_cmd(fd, mtk_cmd_old_write16);
+	ret = fernvale_send_cmd(serfd, mtk_cmd_old_write16);
 	if (ret)
 		return ret;
 
-	ret = fernvale_send_int32(fd, addr);
+	ret = fernvale_send_int32(serfd, addr);
 	if (ret)
 		return ret;
 
 	/* "Count" is in units of 16-bit words, not 8-bit bytes */
-	ret = fernvale_send_int32(fd, count / 2);
+	ret = fernvale_send_int32(serfd, count / 2);
 	if (ret)
 		return ret;
 
@@ -708,7 +776,7 @@ int fernvale_memory_write(int fd, uint32_t addr, uint32_t count,
 		data = (b[2] << 8) | (b[3]);
 
 		printf("Writing data: 0x%04x\n", data);
-		ret = fernvale_txrx(fd, &data, 2);
+		ret = fernvale_txrx(serfd, &data, 2);
 		if (ret) {
 			perror("Unable to write data");
 			return -1;
@@ -717,7 +785,7 @@ int fernvale_memory_write(int fd, uint32_t addr, uint32_t count,
 		data = (b[0] << 8) | (b[1]);
 
 		printf("Writing data: 0x%04x\n", data);
-		ret = fernvale_txrx(fd, &data, 2);
+		ret = fernvale_txrx(serfd, &data, 2);
 		if (ret) {
 			perror("Unable to write data");
 			return -1;
@@ -729,56 +797,56 @@ int fernvale_memory_write(int fd, uint32_t addr, uint32_t count,
 	return 0;
 }
 
-int fernvale_write_reg16(int fd, uint32_t addr, uint16_t val) {
+int fernvale_write_reg16(fd_t serfd, uint32_t addr, uint16_t val) {
 	int ret;
 
-	ret = fernvale_send_cmd(fd, mtk_cmd_old_write16);
+	ret = fernvale_send_cmd(serfd, mtk_cmd_old_write16);
 	if (ret)
 		return ret;
 
-	ret = fernvale_send_int32(fd, addr);
+	ret = fernvale_send_int32(serfd, addr);
 	if (ret)
 		return ret;
 
 	/* "Count" is in units of 16-bit words, not 8-bit bytes */
-	ret = fernvale_send_int32(fd, 1);
+	ret = fernvale_send_int32(serfd, 1);
 	if (ret)
 		return ret;
 
-	return fernvale_send_int16(fd, val);
+	return fernvale_send_int16(serfd, val);
 }
 
-int fernvale_write_reg32(int fd, uint32_t addr, uint32_t val) {
+int fernvale_write_reg32(fd_t serfd, uint32_t addr, uint32_t val) {
 	int ret;
 
-	ret = fernvale_send_cmd(fd, mtk_cmd_old_write16);
+	ret = fernvale_send_cmd(serfd, mtk_cmd_old_write16);
 	if (ret)
 		return ret;
 
-	ret = fernvale_send_int32(fd, addr);
+	ret = fernvale_send_int32(serfd, addr);
 	if (ret)
 		return ret;
 
 	/* "Count" is in units of 16-bit words, not 8-bit bytes */
-	ret = fernvale_send_int32(fd, 2);
+	ret = fernvale_send_int32(serfd, 2);
 	if (ret)
 		return ret;
 
-//	ret = fernvale_send_int32(fd, val);
-	fernvale_send_int16(fd, val >> 16);
-	fernvale_send_int16(fd, val);
+//	ret = fernvale_send_int32(serfd, val);
+	fernvale_send_int16(serfd, val >> 16);
+	fernvale_send_int16(serfd, val);
 	return 0;
 }
 
-uint16_t fernvale_read_reg16(int fd, uint32_t addr) {
+uint16_t fernvale_read_reg16(fd_t serfd, uint32_t addr) {
 	uint16_t val;
-	fernvale_memory_read(fd, addr, 2, &val);
+	fernvale_memory_read(serfd, addr, 2, &val);
 	return val;
 }
 
-uint32_t fernvale_read_reg32(int fd, uint32_t addr) {
+uint32_t fernvale_read_reg32(fd_t serfd, uint32_t addr) {
 	uint32_t val;
-	fernvale_memory_read(fd, addr, 4, &val);
+	fernvale_memory_read(serfd, addr, 4, &val);
 	return val;
 }
 
@@ -791,7 +859,7 @@ int fernvale_reset(void) {
 	write(fd, &b, 1);
 	close(fd);
 	
-	usleep(250000);
+	sleep_ms(250);
 
 	fd = open("/sys/class/gpio/gpio17/value", O_WRONLY);
 	b = '1';
@@ -801,27 +869,27 @@ int fernvale_reset(void) {
 	return 0;
 }
 
-int write_pattern(int fd) {
+int write_pattern(fd_t serfd) {
 	int i;
 
 	for (i = 0; i < 16; i += 2)
-		fernvale_write_reg16(fd, 0x70000000 + i, i | ((i + 1) << 8));
+		fernvale_write_reg16(serfd, 0x70000000 + i, i | ((i + 1) << 8));
 	/*
 		bfr[i] = i;
 	for (i = 0; i < sizeof(bfr); i += 2)
-		fernvale_memory_write(fd, 0x70000000 + i, 2, bfr + i);
+		fernvale_memory_write(serfd, 0x70000000 + i, 2, bfr + i);
 		*/
 
-//	return fernvale_memory_write(fd, 0x70000000, sizeof(bfr), bfr);
+//	return fernvale_memory_write(serfd, 0x70000000, sizeof(bfr), bfr);
 	return 0;
 }
 
-int read_pattern(int fd) {
+int read_pattern(fd_t serfd) {
 	uint8_t bfr[16];
 	uint32_t offset = 0x70006600;
 
 	for (; ; offset += sizeof(bfr)) {
-		if (fernvale_memory_read(fd, offset, sizeof(bfr), bfr))
+		if (fernvale_memory_read(serfd, offset, sizeof(bfr), bfr))
 			return -1;
 		print_hex(bfr, sizeof(bfr), offset);
 	}
@@ -829,66 +897,66 @@ int read_pattern(int fd) {
 	return 0;
 }
 
-static uint16_t fernvale_read16(int fd, uint32_t addr) {
+static uint16_t fernvale_read16(fd_t serfd, uint32_t addr) {
 	uint16_t ret;
 	uint16_t tmp;
 	int count = 1;
 
-	fernvale_send_cmd(fd, mtk_cmd_new_read16);
-	fernvale_send_int32(fd, addr);
-	fernvale_send_int32(fd, count);
-	tmp = fernvale_get_int16(fd);
+	fernvale_send_cmd(serfd, mtk_cmd_new_read16);
+	fernvale_send_int32(serfd, addr);
+	fernvale_send_int32(serfd, count);
+	tmp = fernvale_get_int16(serfd);
 	if (tmp != 0)
 		printf("Response read16 (1) was not 0, was 0x%04x\n", tmp);
-	ret = fernvale_get_int16(fd);
+	ret = fernvale_get_int16(serfd);
 
-	tmp = fernvale_get_int16(fd);
+	tmp = fernvale_get_int16(serfd);
 	if (tmp != 0)
 		printf("Response read16 (3) was not 0, was 0x%04x\n", tmp);
 
 	return ret;
 }
 
-static int fernvale_read32(int fd, uint32_t addr) {
+static int fernvale_read32(fd_t serfd, uint32_t addr) {
 	int ret;
 	int tmp;
 	int count = 1;
 
-	fernvale_send_cmd(fd, mtk_cmd_new_read32);
-	fernvale_send_int32(fd, addr);
-	fernvale_send_int32(fd, count);
+	fernvale_send_cmd(serfd, mtk_cmd_new_read32);
+	fernvale_send_int32(serfd, addr);
+	fernvale_send_int32(serfd, count);
 
-	tmp = fernvale_get_int16(fd);
+	tmp = fernvale_get_int16(serfd);
 	if (tmp != 0)
 		printf("Response read32 (1) was not 0, was 0x%04x\n", tmp);
 
-	ret = fernvale_get_int32(fd);
+	ret = fernvale_get_int32(serfd);
 
-	tmp = fernvale_get_int16(fd);
+	tmp = fernvale_get_int16(serfd);
 	if (tmp != 0)
 		printf("Response read32 (3) was not 0, was 0x%04x\n", tmp);
 
 	return ret;
 }
 
-static int fernvale_write16(int fd, uint32_t addr, uint16_t val) {
+static int fernvale_write16(fd_t serfd, uint32_t addr, uint16_t val) {
 	int tmp;
 	int count = 1;
 	int ret = 0;
 
-	fernvale_send_cmd(fd, mtk_cmd_new_write16);
-	fernvale_send_int32(fd, addr);
-	fernvale_send_int32(fd, count);
+	fernvale_send_cmd(serfd, mtk_cmd_new_write16);
+	fernvale_send_int32(serfd, addr);
+	fernvale_send_int32(serfd, count);
 
-	tmp = fernvale_get_int16(fd);
+	tmp = fernvale_get_int16(serfd);
 	if (tmp != 1) {
 		printf("Response write16 (1) was not 1, was 0x%04x\n", tmp);
 		ret = -1;
 	}
 
-	fernvale_send_int16(fd, val);
+	fernvale_send_int16(serfd, val);
 
-	tmp = fernvale_get_int16(fd);
+	tmp = fernvale_get_int16(serfd);
 	if (tmp != 1) {
 		printf("Response write16 (2) was not 1, was 0x%04x\n", tmp);
 		ret = -1;
@@ -897,26 +965,26 @@ static int fernvale_write16(int fd, uint32_t addr, uint16_t val) {
 	return ret;
 }
 
-static int fernvale_write32(int fd, uint32_t addr, uint32_t val) {
+static int fernvale_write32(fd_t serfd, uint32_t addr, uint32_t val) {
 	int tmp;
 	int ret;
 	int type = 1;
 
 	ret = 0;
 
-	fernvale_send_cmd(fd, mtk_cmd_new_write32);
-	fernvale_send_int32(fd, addr);
-	fernvale_send_int32(fd, type);
+	fernvale_send_cmd(serfd, mtk_cmd_new_write32);
+	fernvale_send_int32(serfd, addr);
+	fernvale_send_int32(serfd, type);
 
-	tmp = fernvale_get_int16(fd);
+	tmp = fernvale_get_int16(serfd);
 	if (tmp != 1) {
 		printf("Response write32 (1) was not 1, was 0x%04x\n", tmp);
 		ret = -1;
 	}
 
-	fernvale_send_int32(fd, val);
+	fernvale_send_int32(serfd, val);
 
-	tmp = fernvale_get_int16(fd);
+	tmp = fernvale_get_int16(serfd);
 	if (tmp != 1) {
 		printf("Response write32 (2) was not 1, was 0x%04x\n", tmp);
 		ret = -1;
@@ -925,8 +993,28 @@ static int fernvale_write32(int fd, uint32_t addr, uint32_t val) {
 	return ret;
 }
 
-int fernvale_set_serial(int serfd) {
+int fernvale_set_serial(fd_t serfd) {
 	int ret;
+#if IS_WINDOWS
+	DCB dcb;
+	if (!GetCommState(serfd, &dcb)) {
+		perror("Could not fetch original serial port configuration: ");
+		return 1;
+	}
+	dcb.BaudRate = BAUDRATE;
+	dcb.ByteSize = 8;
+	dcb.Parity = NOPARITY;
+	dcb.StopBits = ONESTOPBIT;
+	if (!SetCommState(serfd, &dcb)) {
+		perror("Could not change serial port configuration: ");
+		return 1;
+	}
+	if (!GetCommState(serfd, &dcb)) {
+		perror("Could not fetch new serial port configuration: ");
+		return 1;
+	}
+	printf("Baud rate is %ld.\n", dcb.BaudRate);
+#else
 	struct termios t;
 
 	ret = tcgetattr(serfd, &t);
@@ -944,12 +1032,13 @@ int fernvale_set_serial(int serfd) {
 		perror("Failed to set attributes");
 		//exit(1);
 	}
+#endif
 
 	return 0;
 }
 
-static int fernvale_wait_banner(int fd, const char *banner, int banner_size) {
-	//sleep(1);
+static int fernvale_wait_banner(fd_t serfd, const char *banner, int banner_size) {
+	//sleep_ms(1000);
 	//return 0;
 	tcdrain(fd);
 	uint8_t buf[banner_size];
@@ -957,7 +1046,7 @@ static int fernvale_wait_banner(int fd, const char *banner, int banner_size) {
 	int offset = 0;
 	int i;
 
-	while (1 == read(fd, &buf[offset], 1)) {
+	while (1 == ser_read(serfd, &buf[offset], 1)) {
 
 		printf("%c", buf[offset]);
 
@@ -980,7 +1069,7 @@ static int fernvale_wait_banner(int fd, const char *banner, int banner_size) {
 	return -1;
 }
 
-static int fernvale_write_stage2(int serfd, int binfd)
+static int fernvale_write_stage2(fd_t serfd, FILE *binfd)
 {
 	struct stat stats;
 	uint32_t bytes_left;
@@ -988,7 +1077,7 @@ static int fernvale_write_stage2(int serfd, int binfd)
 	uint32_t bytes_total;
 	int ret;
 
-	if (-1 == fstat(binfd, &stats)) {
+	if (-1 == fstat(fileno(binfd), &stats)) {
 		perror("Unable to get file stats");
 		exit(1);
 	}
@@ -1002,21 +1091,21 @@ static int fernvale_write_stage2(int serfd, int binfd)
 		uint8_t b;
 
 		b = bytes_total & 0xff;
-		write(serfd, &b, 1);
+		ser_write(serfd, &b, 1);
 
 		b = bytes_total >> 8 & 0xff;
-		write(serfd, &b, 1);
+		ser_write(serfd, &b, 1);
 
 		b = bytes_total >> 16 & 0xff;
-		write(serfd, &b, 1);
+		ser_write(serfd, &b, 1);
 
 		b = bytes_total >> 24 & 0xff;
-		write(serfd, &b, 1);
+		ser_write(serfd, &b, 1);
 	}
 
 #if (STAGE_2_WRITE_ALL_AT_ONCE)
 	char bfr[bytes_total];
-	ret = read(binfd, bfr, sizeof(bfr));
+	ret = fread(bfr, 1, sizeof(bfr), binfd);
 	if (-1 == ret) {
 		perror("Unable to read data from payload file");
 		return -1;
@@ -1027,7 +1116,7 @@ static int fernvale_write_stage2(int serfd, int binfd)
 		return -1;
 	}
 
-	ret = write(serfd, bfr, sizeof(bfr));
+	ret = ser_write(serfd, bfr, sizeof(bfr));
 	if (-1 == ret) {
 		perror("Unable to write data to output");
 		return -1;
@@ -1047,7 +1136,7 @@ static int fernvale_write_stage2(int serfd, int binfd)
 		if (bytes_left < bytes_to_write)
 			bytes_to_write = bytes_left;
 		
-		ret = read(binfd, bfr, bytes_to_write);
+		ret = fread(bfr, 1, bytes_to_write, binfd);
 		if (-1 == ret) {
 			perror("Unable to read data from payload file");
 			return -1;
@@ -1058,7 +1147,7 @@ static int fernvale_write_stage2(int serfd, int binfd)
 			return -1;
 		}
 
-		ret = write(serfd, bfr, bytes_to_write);
+		ret = ser_write(serfd, bfr, bytes_to_write);
 		if (-1 == ret) {
 			perror("Unable to write data to output");
 			return -1;
@@ -1084,22 +1173,22 @@ static int fernvale_write_stage2(int serfd, int binfd)
 	return 0;
 }
 
-static int fernvale_write_stage3(int serfd, int binfd)
+static int fernvale_write_stage3(fd_t serfd, FILE *binfd)
 {
 	struct stat stats;
 	uint32_t bytes_left, bytes_written, bytes_total;
-	int ret;
+	ret_t ret = 0;
 	char cmd[128];
 
-	if (-1 == fstat(binfd, &stats)) {
+	if (-1 == fstat(fileno(binfd), &stats)) {
 		perror("Unable to get file stats");
 		exit(1);
 	}
 
 	bytes_left = snprintf(cmd, sizeof(cmd) - 1,
 			"loadjmp 0 %d\n", (int)stats.st_size);
-	write(serfd, cmd, bytes_left);
-	read(serfd, cmd, sizeof(cmd));
+	ser_write(serfd, cmd, bytes_left);
+	ser_read(serfd, cmd, sizeof(cmd));
 
 	bytes_left = stats.st_size;
 	bytes_total = stats.st_size;
@@ -1110,7 +1199,7 @@ static int fernvale_write_stage3(int serfd, int binfd)
 
 #if (STAGE_3_WRITE_ALL_AT_ONCE)
 	char bfr[bytes_total];
-	ret = read(binfd, bfr, sizeof(bfr));
+	ret = fread(bfr, 1, sizeof(bfr), binfd);
 	if (-1 == ret) {
 		perror("Unable to read data from payload file");
 		return -1;
@@ -1121,7 +1210,7 @@ static int fernvale_write_stage3(int serfd, int binfd)
 		return -1;
 	}
 
-	ret = write(serfd, bfr, sizeof(bfr));
+	ret = ser_write(serfd, bfr, sizeof(bfr));
 	if (-1 == ret) {
 		perror("Unable to write data to output");
 		return -1;
@@ -1141,7 +1230,7 @@ static int fernvale_write_stage3(int serfd, int binfd)
 		if (bytes_left < bytes_to_write)
 			bytes_to_write = bytes_left;
 		
-		ret = read(binfd, bfr, bytes_to_write);
+		ret = fread(bfr, 1, bytes_to_write, binfd);
 		if (-1 == ret) {
 			perror("Unable to read data from payload file");
 			return -1;
@@ -1152,7 +1241,7 @@ static int fernvale_write_stage3(int serfd, int binfd)
 			return -1;
 		}
 
-		ret = write(serfd, bfr, bytes_to_write);
+		ret = ser_write(serfd, bfr, bytes_to_write);
 		if (-1 == ret) {
 			perror("Unable to write data to output");
 			return -1;
@@ -1306,27 +1395,27 @@ static void update_screen_bitmap(uint16_t *screen, uint32_t keymask) {
 	draw_button(screen, 196, 272 + 16, color, keymask, '#');
 }
 
-static void draw_bitmap_to_screen(int serfd, void *bitmap, int size) {
+static void draw_bitmap_to_screen(fd_t serfd, void *bitmap, int size) {
 	char cmd[128];
 	uint32_t count;
 
 	fernvale_wait_banner(serfd, prompt, strlen(prompt));
 	count = snprintf(cmd, sizeof(cmd) - 1, "load 0x40000 %d\n", size);
-	write(serfd, cmd, count);
-	read(serfd, cmd, count);
-	write(serfd, bitmap, size);
+	ser_write(serfd, cmd, count);
+	ser_read(serfd, cmd, count);
+	ser_write(serfd, bitmap, size);
 
 	fernvale_wait_banner(serfd, prompt, strlen(prompt));
 	count = snprintf(cmd, sizeof(cmd) - 1, "lcd run\n");
-	write(serfd, cmd, count);
-	read(serfd, cmd, count);
+	ser_write(serfd, cmd, count);
+	ser_read(serfd, cmd, count);
 }
 
-static void do_factory_test(int serfd) {
+static void do_factory_test(fd_t serfd) {
 	char cmd[128];
 	uint32_t count;
-	int ret;
-	struct termios t;
+	ret_t ret = 0;
+	//struct termios t;
 	int light_is_on = 1;
 
 	/*
@@ -1353,8 +1442,8 @@ static void do_factory_test(int serfd) {
 	test_begin("Turn on LED");
 	fernvale_wait_banner(serfd, prompt, strlen(prompt));
 	count = snprintf(cmd, sizeof(cmd) - 1, "led 1\n");
-	write(serfd, cmd, count);
-	read(serfd, cmd, count);
+	ser_write(serfd, cmd, count);
+	ser_read(serfd, cmd, count);
 	test_end(0);
 
 	test_begin("Keypad");
@@ -1373,12 +1462,12 @@ static void do_factory_test(int serfd) {
 			if (needs_to_rerun) {
 				fernvale_wait_banner(serfd, prompt, strlen(prompt));
 				count = snprintf(cmd, sizeof(cmd) - 1, "keypad 1\n");
-				write(serfd, cmd, count);
-				read(serfd, cmd, count);
+				ser_write(serfd, cmd, count);
+				ser_read(serfd, cmd, count);
 	//				printf("Getting command back: ");
 				fflush(stdout);
 				do {
-					ret = read(serfd, cmd, 1);
+					ret = ser_read(serfd, cmd, 1);
 	//					printf("%c [%x] %d", cmd[0], cmd[0], ret);
 					//printf("%c", cmd[0]);
 					fflush(stdout);
@@ -1387,7 +1476,7 @@ static void do_factory_test(int serfd) {
 	//				printf("\n\nWaiting for first message: ");
 				fflush(stdout);
 				do {
-					ret = read(serfd, cmd, 1);
+					ret = ser_read(serfd, cmd, 1);
 	//					printf("%c [%x] %d", cmd[0], cmd[0], ret);
 					//printf("%c", cmd[0]);
 	//					fflush(stdout);
@@ -1396,7 +1485,7 @@ static void do_factory_test(int serfd) {
 	//				printf("\n\nWaiting for second message: ");
 				fflush(stdout);
 				do {
-					ret = read(serfd, cmd, 1);
+					ret = ser_read(serfd, cmd, 1);
 	//					printf("%c [%x] %d", cmd[0], cmd[0], ret);
 					//printf("%c", cmd[0]);
 	//					fflush(stdout);
@@ -1406,7 +1495,7 @@ static void do_factory_test(int serfd) {
 				needs_to_rerun = 0;
 			}
 
-			if (read(serfd, &c, sizeof(c)) != 1) {
+			if (ser_read(serfd, &c, sizeof(c)) != 1) {
 				test_fail("Unable to read from port");
 				return;
 			}
@@ -1420,7 +1509,7 @@ static void do_factory_test(int serfd) {
 				needs_to_rerun = 1;
 			else if (!keymask) {
 				cmd[0] = '\n';
-				write(serfd, cmd, 1);
+				ser_write(serfd, cmd, 1);
 			}
 
 			update_screen_bitmap(screen_bitmap, keymask);
@@ -1429,15 +1518,15 @@ static void do_factory_test(int serfd) {
 			if (light_is_on) {
 				fernvale_wait_banner(serfd, prompt, strlen(prompt));
 				count = snprintf(cmd, sizeof(cmd) - 1, "led 0\n");
-				write(serfd, cmd, count);
-				read(serfd, cmd, count);
+				ser_write(serfd, cmd, count);
+				ser_read(serfd, cmd, count);
 				light_is_on = 0;
 			}
 		}
 		/* Exit test */
 		count = snprintf(cmd, sizeof(cmd) - 1, "\n");
-		write(serfd, cmd, count);
-		read(serfd, cmd, sizeof(cmd));
+		ser_write(serfd, cmd, count);
+		ser_read(serfd, cmd, sizeof(cmd));
 		test_end(0);
 	}
 	return;
@@ -1488,7 +1577,11 @@ static void print_help(const char *name)
 }
 
 int main(int argc, char **argv) {
-	int serfd, binfd = -1, s1blfd, payloadfd = -1, logfd = -1;
+	fd_t serfd;
+	FILE *binfd = NULL;
+	FILE *s1blfd = NULL;
+	FILE *payloadfd = NULL;
+	FILE *logfd = NULL;
 	char *logname = NULL;
 	uint32_t ret;
 	int opt;
@@ -1543,12 +1636,30 @@ int main(int argc, char **argv) {
 		fflush(stdout);
 	}
 	while (1) {
+#if IS_WINDOWS
+		char *dev = argv[1];
+		if ((strlen(argv[1]) > 3) &&
+		    (tolower((unsigned char)argv[1][0]) == 'c') &&
+		    (tolower((unsigned char)argv[1][1]) == 'o') &&
+		    (tolower((unsigned char)argv[1][2]) == 'm')) {
+			dev = malloc(strlen(argv[1]) + 5);
+			if (!dev) {
+				perror("Out of memory: ");
+				exit(1);
+			}
+			strcpy(dev, "\\\\.\\");
+			strcpy(dev + 4, argv[1]);
+		}
+	        serfd = CreateFile(dev, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+		if (INVALID_HANDLE_VALUE == serfd) {
+#else
 		serfd = open(argv[1], O_RDWR);
 		if (-1 == serfd) {
+#endif
 			if (wait_serial) {
 				printf(".");
 				fflush(stdout);
-				sleep(1);
+				sleep_ms(1000);
 				continue;
 			} else {
 				perror("Unable to open serial port");
@@ -1561,23 +1672,23 @@ int main(int argc, char **argv) {
 		printf("\n");
 	}
 
-	s1blfd = open(argv[2], O_RDONLY);
-	if (-1 == s1blfd) {
+	s1blfd = fopen(argv[2], "rb");
+	if (NULL == s1blfd) {
 		perror("Unable to open stage 1 bootloader");
 		exit(1);
 	}
 
 	if (argc == 4 || argc == 5) {
-		binfd = open(argv[3], O_RDONLY);
-		if (-1 == binfd) {
+		binfd = fopen(argv[3], "rb");
+		if (NULL == binfd) {
 			perror("Unable to open firmware file");
 			exit(1);
 		}
 	}
 
 	if (argc == 5) {
-		payloadfd = open(argv[4], O_RDONLY);
-		if (-1 == payloadfd) {
+		payloadfd = fopen(argv[4], "rb");
+		if (NULL == payloadfd) {
 			perror("Unable to open payload file");
 			exit(1);
 		}
@@ -1668,7 +1779,7 @@ int main(int argc, char **argv) {
 
 	cmd_begin("Disabling PSRAM -> ROM remapping");
 	fernvale_write32(serfd, 0xa0510000, 2);
-	usleep(20000);
+	sleep_ms(20);
 	cmd_end();
 
 	cmd_begin("Checking PSRAM mapping");
@@ -1681,7 +1792,7 @@ int main(int argc, char **argv) {
 
 	cmd_begin("Updating PSRAM mapping again for some reason");
 	fernvale_write32(serfd, 0xa0510000, 2);
-	usleep(50000);
+	sleep_ms(50);
 	cmd_end();
 
 	cmd_begin("Reading some fuses");
@@ -1707,12 +1818,12 @@ int main(int argc, char **argv) {
 	ASSERT(fernvale_wait_banner(serfd, ">", 1));
 	cmd_end();
 
-	if (binfd == -1) {
-		close(serfd);
+	if (binfd == NULL) {
+		ser_close(serfd);
 		return 0;
 	}
 
-	if (binfd != -1) {
+	if (binfd != NULL) {
 		cmd_begin("Writing stage 2");
 		ASSERT(fernvale_write_stage2(serfd, binfd));
 		cmd_end();
@@ -1725,7 +1836,7 @@ int main(int argc, char **argv) {
 		return 0;
 	}
 
-	if (payloadfd != -1) {
+	if (payloadfd != NULL) {
 		cmd_begin("Entering download mode");
 		fernvale_wait_banner(serfd, prompt, strlen(prompt));
 		cmd_end();
@@ -1735,6 +1846,7 @@ int main(int argc, char **argv) {
 		cmd_end();
 	}
 
+#if !IS_WINDOWS
 	if (shell) {
 		cmd_begin("Start Fernly shell");
 		uint8_t bfr;
@@ -1755,8 +1867,8 @@ int main(int argc, char **argv) {
 		}
 
 		if (logname) {
-			logfd = open(logname, O_WRONLY | O_CREAT | O_APPEND);
-			if (-1 == logfd)
+			logfd = fopen(logname, "a+t");
+			if (NULL == logfd)
 				perror("Warning: could not open logfile");
 		}
 
@@ -1778,8 +1890,8 @@ int main(int argc, char **argv) {
 				}
 				else {
 					write(STDOUT_FILENO, &bfr, sizeof(bfr));
-					if (logfd != -1)
-						write(logfd, &bfr, sizeof(bfr));
+					if (logfd != NULL)
+						fwrite(&bfr, 1, sizeof(bfr), logfd);
 				}
 			}
 			if (FD_ISSET(STDIN_FILENO, &rfds)) {
@@ -1791,12 +1903,15 @@ int main(int argc, char **argv) {
 			}
 		}
 	}
-	else {
+	else
+#endif
+	{
 		cmd_begin("Waiting for ready prompt");
 		fernvale_wait_banner(serfd, prompt, strlen(prompt));
 		cmd_end();
 	}
 
-	close(serfd);
+	ser_close(serfd);
+
 	return 0;
 }

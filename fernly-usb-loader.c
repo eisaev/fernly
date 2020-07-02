@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <arpa/inet.h>
+#include <time.h>
 #endif
 
 #include "sha1.h"
@@ -113,12 +114,20 @@ static ret_t ser_write(fd_t fd, void *b, int size)
 {
 	ret_t ret = 0;
 	uint8_t *bfr = b;
+	int remain = size;
 
+	while (remain > 0) {
 #if IS_WINDOWS
-	WriteFile(fd, bfr, size, &ret, NULL);
+		WriteFile(fd, bfr, size, &ret, NULL);
 #else
-	ret = write(fd, bfr, size);
+		ret = write(fd, bfr, size);
 #endif
+		if (ret == -1) {
+			break;
+		}
+		remain -= ret;
+		bfr += ret;
+	}
 
 	return ret;
 }
@@ -127,12 +136,20 @@ static ret_t ser_read(fd_t fd, void *b, int size)
 {
 	ret_t ret = 0;
 	uint8_t *bfr = b;
+	int remain = size;
 
+	while (remain > 0) {
 #if IS_WINDOWS
-	ReadFile(fd, bfr, size, &ret, NULL);
+		ReadFile(fd, bfr, size, &ret, NULL);
 #else
-	ret = read(fd, bfr, size);
+		ret = read(fd, bfr, size);
 #endif
+		if (ret == -1) {
+			break;
+		}
+		remain -= ret;
+		bfr += ret;
+	}
 
 	return ret;
 }
@@ -1040,7 +1057,7 @@ int fernvale_set_serial(fd_t serfd) {
 static int fernvale_wait_banner(fd_t serfd, const char *banner, int banner_size) {
 	//sleep_ms(1000);
 	//return 0;
-	tcdrain(fd);
+	tcdrain(serfd);
 	uint8_t buf[banner_size];
 	int tst;
 	int offset = 0;
@@ -1205,7 +1222,7 @@ static int fernvale_write_stage3(fd_t serfd, FILE *binfd)
 		return -1;
 	}
 	else if (ret != bytes_total) {
-		fprintf(stderr, "Shortened read (want: %d got: %d)\n",
+		fprintf(stderr, "Shortened read (want: %d got: %ld)\n",
 				bytes_total, ret);
 		return -1;
 	}
@@ -1216,7 +1233,7 @@ static int fernvale_write_stage3(fd_t serfd, FILE *binfd)
 		return -1;
 	}
 	else if (ret != bytes_total) {
-		fprintf(stderr, "Shortened write (want: %d got: %d)\n",
+		fprintf(stderr, "Shortened write (want: %d got: %ld)\n",
 				(int) sizeof(bfr), ret);
 		return -1;
 	}
@@ -1552,7 +1569,7 @@ static void cmd_end_fmt(const char *fmt, ...) {
 
 static void print_help(const char *name)
 {
-	printf("Usage: %s [-a address] [-l logfile] [-s] [serial port] "
+	printf("Usage: %s [-a address] [-l logfile] [-wst12h] [serial port] "
 			"[stage 1 bootloader] "
 			"[[stage 2 bootloader]] "
 			"[payload]\n", name);
@@ -1564,6 +1581,8 @@ static void print_help(const char *name)
 	printf("    -w                Wait for serial port to appear\n");
 	printf("    -s                Enter boot shell\n");
 	printf("    -t                Run fernly factory test\n");
+	printf("    -1                Run `hello` command only (to hold the service serial device for 30 seconds)\n");
+	printf("    -2                Run all other commands except `hello`\n");
 	printf("    -h                Print this help\n");
 	printf("\n");
 	printf("If you don't want a stage 2 bootloader, you may omit "
@@ -1588,10 +1607,12 @@ int main(int argc, char **argv) {
 	int shell = 0;
 	int wait_serial = 0;
 	int factory_test = 0;
+	int first_step = 0;
+	int second_step = 0;
 
 	uint32_t usb_loader_addr = FERNLY_USB_LOADER_ADDR;
 
-	while ((opt = getopt(argc, argv, "a:hl:swt")) != -1) {
+	while ((opt = getopt(argc, argv, "a:hl:swt12")) != -1) {
 		switch(opt) {
 
 		case 'a':
@@ -1614,6 +1635,14 @@ int main(int argc, char **argv) {
 			factory_test = 1;
 			break;
 
+		case '1':
+			first_step = 1;
+			break;
+
+		case '2':
+			second_step = 1;
+			break;
+
 		default:
 		case 'h':
 			print_help(argv[0]);
@@ -1626,7 +1655,7 @@ int main(int argc, char **argv) {
 	argc -= (optind - 1);
 	argv += (optind - 1);
 
-	if ((argc != 3) && (argc != 4) && (argc != 5)) {
+	if ((argc != 2) && (argc != 3) && (argc != 4) && (argc != 5)) {
                 printf("%d is wrong # of args\n", argc);
 		exit(1);
 	}
@@ -1672,25 +1701,27 @@ int main(int argc, char **argv) {
 		printf("\n");
 	}
 
-	s1blfd = fopen(argv[2], "rb");
-	if (NULL == s1blfd) {
-		perror("Unable to open stage 1 bootloader");
-		exit(1);
-	}
-
-	if (argc == 4 || argc == 5) {
-		binfd = fopen(argv[3], "rb");
-		if (NULL == binfd) {
-			perror("Unable to open firmware file");
+	if (first_step == 0) {
+		s1blfd = fopen(argv[2], "rb");
+		if (NULL == s1blfd) {
+			perror("Unable to open stage 1 bootloader");
 			exit(1);
 		}
-	}
 
-	if (argc == 5) {
-		payloadfd = fopen(argv[4], "rb");
-		if (NULL == payloadfd) {
-			perror("Unable to open payload file");
-			exit(1);
+		if (argc == 4 || argc == 5) {
+			binfd = fopen(argv[3], "rb");
+			if (NULL == binfd) {
+				perror("Unable to open firmware file");
+				exit(1);
+			}
+		}
+
+		if (argc == 5) {
+			payloadfd = fopen(argv[4], "rb");
+			if (NULL == payloadfd) {
+				perror("Unable to open payload file");
+				exit(1);
+			}
 		}
 	}
 
@@ -1698,9 +1729,16 @@ int main(int argc, char **argv) {
 	ASSERT(fernvale_set_serial(serfd));
 	cmd_end();
 
-	cmd_begin("Initiating communication");
-	ASSERT(fernvale_hello(serfd));
-	cmd_end();
+	if (second_step == 0) {
+		cmd_begin("Initiating communication");
+		ASSERT(fernvale_hello(serfd));
+		cmd_end();
+        }
+
+	if (first_step == 1) {
+		ser_close(serfd);
+		return 0;
+	}
 
 	cmd_begin("Getting hardware version");
 	cmd_end_fmt("0x%04x", fernvale_read_reg16(serfd, mtk_config_offset));
